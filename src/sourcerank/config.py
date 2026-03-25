@@ -9,31 +9,25 @@ class SignalWeights(BaseModel):
     """Weights for each quality signal (must sum to 1.0 for normalized scoring)."""
 
     recency: float = Field(default=0.20, ge=0.0, le=1.0)
-    authority: float = Field(default=0.25, ge=0.0, le=1.0)
-    relevance: float = Field(default=0.30, ge=0.0, le=1.0)
-    completeness: float = Field(default=0.10, ge=0.0, le=1.0)
-    citation_count: float = Field(default=0.15, ge=0.0, le=1.0)
+    authority: float = Field(default=0.20, ge=0.0, le=1.0)
+    completeness: float = Field(default=0.15, ge=0.0, le=1.0)
+    citation_density: float = Field(default=0.20, ge=0.0, le=1.0)
+    factual_language: float = Field(default=0.25, ge=0.0, le=1.0)
 
     def normalized(self) -> "SignalWeights":
         """Return a copy with weights normalized to sum to 1.0."""
         total = (
-            self.recency
-            + self.authority
-            + self.relevance
-            + self.completeness
-            + self.citation_count
+            self.recency + self.authority + self.completeness
+            + self.citation_density + self.factual_language
         )
         if total == 0:
-            return SignalWeights(
-                recency=0.2, authority=0.2, relevance=0.2,
-                completeness=0.2, citation_count=0.2,
-            )
+            return SignalWeights()
         return SignalWeights(
             recency=self.recency / total,
             authority=self.authority / total,
-            relevance=self.relevance / total,
             completeness=self.completeness / total,
-            citation_count=self.citation_count / total,
+            citation_density=self.citation_density / total,
+            factual_language=self.factual_language / total,
         )
 
 

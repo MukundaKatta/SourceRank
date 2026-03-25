@@ -1,434 +1,237 @@
-"""Core ranking engine for SourceRank.
-
-Provides the ``SourceRank`` class with methods to add, score, rank,
-compare, and report on text sources across four quality dimensions:
-recency, authority, citation density, and factual language.
-"""
+"""Core ranking engine for SourceRank."""
 
 from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Any
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence
 
-from pydantic import BaseModel, Field
-
+from sourcerank.config import RankerConfig
 
 # ---------------------------------------------------------------------------
-# Text analysis helpers (inlined for reliability)
+# Helpers
 # ---------------------------------------------------------------------------
 
-_DATE_FORMATS = [
-    "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
-    "%B %d, %Y", "%b %d, %Y",
-    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y",
-]
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_CITATION_RE = re.compile(r"\([A-Z][a-z]+ (?:et al\.,? )?\d{4}\)|\[\d+\]")
+_HEDGING = {"maybe", "perhaps", "possibly", "might", "could", "guess", "seems", "sort of", "kind of", "probably"}
+_FACTUAL = re.compile(r"\d+%|\d{4}|study|data|found|significant|evidence|research|published")
 
-_AUTHORITY_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bDr\.\s", r"\bProf\.\s", r"\bProfessor\s", r"\bPhD\b",
-        r"\bMD\b", r"\bM\.D\.\b",
-        r"\buniversity\b", r"\binstitute\b", r"\blaboratory\b",
-        r"\bhospital\b", r"\bjournal\b", r"\bpublished\s+in\b",
-        r"\bpeer[\s-]reviewed\b", r"\bgovernment\b", r"\bministry\b",
-        r"\bnational\b", r"\bfederal\b", r"\bworld\s+health\b",
-    ]
-]
-
-_AUTHORITY_DOMAINS = [
-    "nature.com", "science.org", "thelancet.com", "nejm.org",
-    "ieee.org", "acm.org", "arxiv.org", "gov", "edu",
-    "who.int", "nih.gov", "cdc.gov",
-]
-
-_CITATION_PATTERNS = [
-    re.compile(r"\([A-Z][a-z]+(?:\s+(?:et\s+al\.?|&\s+[A-Z][a-z]+))?,?\s*\d{4}\)"),
-    re.compile(r"\[\d+\]"),
-    re.compile(r"\b(?:doi|DOI)\s*:\s*10\.\d{4,}"),
-    re.compile(r"https?://(?:dx\.)?doi\.org/10\.\d{4,}"),
-    re.compile(r"\(\d{4}\)"),
-    re.compile(r"\b(?:ibid|op\.\s*cit|loc\.\s*cit)\b", re.IGNORECASE),
-]
-
-_HEDGING_COMPILED = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bmaybe\b", r"\bperhaps\b", r"\bpossibly\b", r"\bmight\b",
-        r"\bcould\b", r"\bseems?\s+(?:to|like)\b", r"\bappears?\s+to\b",
-        r"\bsort\s+of\b", r"\bkind\s+of\b", r"\bwho\s+knows\b",
-        r"\bi\s+think\b", r"\bi\s+believe\b", r"\bi\s+guess\b",
-        r"\bprobably\b", r"\ballegedly\b", r"\bsupposedly\b",
-        r"\brumo(?:u)?rs?\b",
-    ]
-]
-
-_FACTUAL_INDICATORS = [
-    re.compile(r"\d+(?:\.\d+)?%"),
-    re.compile(r"\b\d{4}\b"),
-    re.compile(r"\b(?:according\s+to|based\s+on)\b", re.I),
-    re.compile(r"\b(?:study|research|data|evidence|analysis)\b", re.I),
-    re.compile(r"\b(?:found\s+that|showed\s+that|demonstrated)\b", re.I),
-    re.compile(r"\b(?:statistic(?:al|s)?|significant(?:ly)?)\b", re.I),
-    re.compile(r"\b\d+(?:\.\d+)?\s*(?:million|billion|trillion|thousand)\b", re.I),
-]
-
-CITATION_SATURATION = 10
-RECENCY_HALF_LIFE_DAYS = 365
+# Authority TLD scores
+_DEFAULT_AUTHORITY: Dict[str, float] = {
+    ".gov": 0.95, ".edu": 0.90, ".org": 0.75, ".ac.uk": 0.88,
+    "nature.com": 0.92, "science.org": 0.90, "pubmed": 0.88,
+    "arxiv.org": 0.85, "ieee.org": 0.85, "springer.com": 0.80,
+}
+_LOW_AUTHORITY = {"blogspot", "wordpress", "medium.com", ".xyz", ".tk", ".buzz"}
 
 
-def _parse_date(value: str | None) -> date | None:
+def _parse_date(value: Any) -> Optional[datetime]:
     if value is None:
         return None
-    value = value.strip()
-    for fmt in _DATE_FORMATS:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    value = str(value).strip()
+    if _ISO_RE.match(value):
         try:
-            return datetime.strptime(value, fmt).date()
+            dt = datetime.fromisoformat(value)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
         except ValueError:
-            continue
+            pass
     return None
 
 
-def _days_since(d: date) -> int:
-    return max((date.today() - d).days, 0)
-
-
-def _recency_decay(days: int, half_life: int) -> float:
-    if days <= 0:
-        return 1.0
-    return math.exp(-0.693147 * days / half_life)
-
-
-def _count_authority_signals(text: str) -> int:
-    return sum(1 for pat in _AUTHORITY_PATTERNS if pat.search(text))
-
-
-def _domain_is_authoritative(domain: str | None) -> bool:
-    if not domain:
-        return False
-    d = domain.lower().strip()
-    return any(d.endswith(t) for t in _AUTHORITY_DOMAINS)
-
-
-def _count_citations(text: str) -> int:
-    return sum(len(pat.findall(text)) for pat in _CITATION_PATTERNS)
-
-
-def _factual_language_score(text: str) -> float:
-    words = len(text.split())
-    if words == 0:
-        return 0.0
-    factual = sum(len(pat.findall(text)) for pat in _FACTUAL_INDICATORS)
-    hedging = sum(len(pat.findall(text)) for pat in _HEDGING_COMPILED)
-    net = (factual - hedging) / (words / 100)
-    clamped = max(-5.0, min(net, 5.0))
-    return round((clamped + 5.0) / 10.0, 4)
+def _days_since(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    return max(0, (datetime.now(timezone.utc) - dt).days)
 
 
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
-
-class Source(BaseModel):
-    """Internal representation of a source document."""
-
+@dataclass
+class Source:
+    """A single source document to be ranked."""
     text: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    scores: dict[str, float] = Field(default_factory=dict)
-    composite_score: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    id: int = 0
+
+# Keep backward compat
+SourceDocument = Source
 
 
 @dataclass
-class RankedSource:
-    """A source with its composite score and per-signal breakdown."""
+class QualitySignals:
+    """Individual quality signal scores."""
+    recency: float = 0.0
+    authority: float = 0.0
+    relevance: float = 0.0
+    completeness: float = 0.0
+    citation_density: float = 0.0
+    factual_language: float = 0.0
 
-    rank: int
+
+@dataclass
+class RankingResult:
+    """A ranked source with scores."""
     source: Source
     composite_score: float
-    scores: dict[str, float]
+    signals: QualitySignals
+    rank: int = 0
 
 
 @dataclass
 class ComparisonResult:
-    """Side-by-side comparison of two sources."""
-
-    source_a: Source
-    source_b: Source
-    scores_a: dict[str, float]
-    scores_b: dict[str, float]
-    composite_a: float
-    composite_b: float
-    winner: str  # "a", "b", or "tie"
-    advantage: float  # absolute difference
+    """Result of comparing two sources."""
+    winner: str  # "a" or "b"
+    advantage: float
+    a_score: float
+    b_score: float
 
 
 # ---------------------------------------------------------------------------
-# Configuration (simplified for the four-signal API)
+# SourceRanker
 # ---------------------------------------------------------------------------
 
+class SourceRanker:
+    """Rank and score source documents by quality."""
 
-class SourceRankConfig(BaseModel):
-    """Scoring weights and thresholds for the SourceRank engine.
+    def __init__(self, config: Optional[RankerConfig] = None) -> None:
+        self.config = config or RankerConfig()
+        self._sources: List[Source] = []
+        self._next_id = 1
 
-    The four signal weights must sum to 1.0.
-    """
+    def add_source(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> Source:
+        """Add a source document and return it."""
+        src = Source(text=text, metadata=metadata or {}, id=self._next_id)
+        self._next_id += 1
+        self._sources.append(src)
+        return src
 
-    recency_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    authority_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    citation_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    factual_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    recency_half_life_days: int = Field(default=365, gt=0)
-    citation_saturation: int = Field(default=10, gt=0)
-
-
-# ---------------------------------------------------------------------------
-# SourceRank
-# ---------------------------------------------------------------------------
-
-
-class SourceRank:
-    """Evaluate and rank text sources by quality and reliability.
-
-    Scores each source from 0 to 1 on four dimensions -- recency, authority,
-    citation density, and factual language -- then produces a weighted
-    composite score used for ranking.
-
-    Parameters
-    ----------
-    config : SourceRankConfig | None
-        Custom weights and thresholds.  Uses balanced defaults when *None*.
-
-    Examples
-    --------
-    >>> ranker = SourceRank()
-    >>> ranker.add_source("Some text", {"date": "2025-06-01"})
-    >>> rankings = ranker.rank_sources()
-    """
-
-    def __init__(self, config: SourceRankConfig | None = None) -> None:
-        self.config = config or SourceRankConfig()
-        self._sources: list[Source] = []
-
-    # -- adding sources -----------------------------------------------------
-
-    def add_source(self, text: str, metadata: dict[str, Any] | None = None) -> Source:
-        """Add a source for evaluation.
-
-        Parameters
-        ----------
-        text : str
-            The full text content of the source.
-        metadata : dict, optional
-            Arbitrary metadata.  Recognised keys include ``date``,
-            ``author``, and ``domain``.
-
-        Returns
-        -------
-        Source
-            The newly created source object.
-        """
-        source = Source(text=text, metadata=metadata or {})
-        self._sources.append(source)
-        return source
-
-    @property
-    def sources(self) -> list[Source]:
-        """Return a copy of the current source list."""
-        return list(self._sources)
-
-    # -- individual signal scorers ------------------------------------------
+    # -- Individual signal scorers ------------------------------------------
 
     def score_recency(self, source: Source) -> float:
-        """Score a source 0-1 based on its publication date freshness.
-
-        Uses exponential decay with the configured half-life.  Sources
-        without a ``date`` in their metadata receive a default score of 0.3.
-        """
-        raw_date = source.metadata.get("date")
-        parsed = _parse_date(raw_date)
-        if parsed is None:
+        """Score recency based on date in metadata."""
+        date_str = source.metadata.get("date")
+        dt = _parse_date(date_str)
+        age = _days_since(dt)
+        if age is None:
             return 0.3
-        age_days = _days_since(parsed)
-        return round(_recency_decay(age_days, self.config.recency_half_life_days), 4)
+        max_age = 3650  # 10 years
+        if age >= max_age:
+            return 0.0
+        return round(1.0 - (age / max_age), 4)
 
     def score_authority(self, source: Source) -> float:
-        """Score a source 0-1 based on authority signals.
-
-        Combines two sub-signals:
-        - **Domain trust** (50%): whether the metadata ``domain`` matches a
-          known authoritative suffix.
-        - **Textual authority markers** (50%): titles (Dr., Prof.), institution
-          names, and phrases like "peer-reviewed" found in the text.
-        """
-        domain = source.metadata.get("domain")
-        domain_score = 1.0 if _domain_is_authoritative(domain) else 0.0
-
-        signals = _count_authority_signals(source.text)
-        author = source.metadata.get("author", "")
-        signals += _count_authority_signals(author)
-        text_score = min(signals / 3.0, 1.0)
-
-        return round(0.5 * domain_score + 0.5 * text_score, 4)
+        """Score authority based on domain in metadata."""
+        domain = source.metadata.get("domain", "").lower()
+        if not domain:
+            return 0.5
+        for key, score in _DEFAULT_AUTHORITY.items():
+            if key in domain:
+                return score
+        for low in _LOW_AUTHORITY:
+            if low in domain:
+                return 0.2
+        return 0.5
 
     def score_citation_density(self, source: Source) -> float:
-        """Score a source 0-1 based on in-text citation density.
-
-        Counts citation patterns (APA-style, numeric brackets, DOI links)
-        and maps the count to [0, 1] with configurable saturation.
-        """
-        count = _count_citations(source.text)
-        return round(min(count / self.config.citation_saturation, 1.0), 4)
+        """Score based on number of citations/references in text."""
+        citations = _CITATION_RE.findall(source.text)
+        count = len(citations)
+        if count == 0:
+            return 0.0
+        return min(1.0, count * 0.25)
 
     def score_factual_language(self, source: Source) -> float:
-        """Score a source 0-1 based on factual vs. hedging language.
+        """Score based on factual vs hedging language."""
+        text_lower = source.text.lower()
+        words = _WORD_RE.findall(text_lower)
+        total = max(len(words), 1)
 
-        Higher scores indicate more data-driven, precise language and fewer
-        hedging phrases like "maybe", "sort of", "who knows".
-        """
-        return _factual_language_score(source.text)
+        # Count factual indicators
+        factual_hits = len(_FACTUAL.findall(text_lower))
+        # Count hedging indicators
+        hedge_hits = sum(1 for w in words if w in _HEDGING)
 
-    # -- composite scoring --------------------------------------------------
+        factual_ratio = factual_hits / total
+        hedge_ratio = hedge_hits / total
 
-    def _compute_scores(self, source: Source) -> dict[str, float]:
-        """Compute all four signal scores and the weighted composite."""
-        scores = {
-            "recency": self.score_recency(source),
-            "authority": self.score_authority(source),
-            "citation_density": self.score_citation_density(source),
-            "factual_language": self.score_factual_language(source),
-        }
+        score = 0.5 + factual_ratio * 5.0 - hedge_ratio * 5.0
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def score_completeness(self, source: Source) -> float:
+        """Score based on text length."""
+        length = len(source.text)
+        if length < 50:
+            return 0.1
+        if length >= 500:
+            return 1.0
+        return round(length / 500, 4)
+
+    def _compute_composite(self, source: Source) -> tuple[float, QualitySignals]:
+        """Compute all signals and composite score."""
+        signals = QualitySignals(
+            recency=self.score_recency(source),
+            authority=self.score_authority(source),
+            citation_density=self.score_citation_density(source),
+            factual_language=self.score_factual_language(source),
+            completeness=self.score_completeness(source),
+        )
+        w = self.config.weights
         composite = (
-            self.config.recency_weight * scores["recency"]
-            + self.config.authority_weight * scores["authority"]
-            + self.config.citation_weight * scores["citation_density"]
-            + self.config.factual_weight * scores["factual_language"]
+            w.recency * signals.recency
+            + w.authority * signals.authority
+            + w.completeness * signals.completeness
+            + w.citation_density * signals.citation_density
+            + w.factual_language * signals.factual_language
         )
-        scores["composite"] = round(composite, 4)
-        source.scores = scores
-        source.composite_score = scores["composite"]
-        return scores
+        return round(composite, 6), signals
 
-    # -- ranking ------------------------------------------------------------
+    # -- Ranking API --------------------------------------------------------
 
-    def rank_sources(self, sources: list[Source] | None = None) -> list[RankedSource]:
-        """Rank all added sources (or a custom list) by composite score.
+    def rank_sources(self) -> List[RankingResult]:
+        """Rank all added sources. Returns list sorted by composite score."""
+        if not self._sources:
+            return []
+        results = []
+        for src in self._sources:
+            score, signals = self._compute_composite(src)
+            results.append(RankingResult(source=src, composite_score=score, signals=signals))
+        results.sort(key=lambda r: r.composite_score, reverse=True)
+        for i, r in enumerate(results):
+            r.rank = i + 1
+        return results
 
-        Parameters
-        ----------
-        sources : list[Source] | None
-            Sources to rank.  Defaults to all sources added via
-            ``add_source``.
+    def get_top_sources(self, k: int) -> List[RankingResult]:
+        """Return top-k ranked sources."""
+        return self.rank_sources()[:k]
 
-        Returns
-        -------
-        list[RankedSource]
-            Sources ordered best-first with rank numbers starting at 1.
-        """
-        target = sources if sources is not None else self._sources
-        for src in target:
-            self._compute_scores(src)
-
-        sorted_sources = sorted(target, key=lambda s: s.composite_score, reverse=True)
-        return [
-            RankedSource(
-                rank=i + 1,
-                source=src,
-                composite_score=src.composite_score,
-                scores=dict(src.scores),
-            )
-            for i, src in enumerate(sorted_sources)
-        ]
-
-    def get_top_sources(
-        self, n: int, sources: list[Source] | None = None
-    ) -> list[RankedSource]:
-        """Return the top *n* ranked sources.
-
-        Parameters
-        ----------
-        n : int
-            Number of top sources to return.
-        sources : list[Source] | None
-            Sources to rank.  Defaults to all added sources.
-        """
-        rankings = self.rank_sources(sources)
-        return rankings[:n]
-
-    # -- comparison ---------------------------------------------------------
-
-    def compare_sources(self, s1: Source, s2: Source) -> ComparisonResult:
-        """Side-by-side comparison of two sources.
-
-        Returns a ``ComparisonResult`` indicating which source is stronger
-        and by how much.
-        """
-        scores_a = self._compute_scores(s1)
-        scores_b = self._compute_scores(s2)
-        comp_a = scores_a["composite"]
-        comp_b = scores_b["composite"]
-
-        if abs(comp_a - comp_b) < 1e-6:
-            winner = "tie"
-        elif comp_a > comp_b:
-            winner = "a"
-        else:
-            winner = "b"
-
+    def compare_sources(self, a: Source, b: Source) -> ComparisonResult:
+        """Compare two sources directly."""
+        a_score, _ = self._compute_composite(a)
+        b_score, _ = self._compute_composite(b)
+        winner = "a" if a_score >= b_score else "b"
         return ComparisonResult(
-            source_a=s1,
-            source_b=s2,
-            scores_a=scores_a,
-            scores_b=scores_b,
-            composite_a=comp_a,
-            composite_b=comp_b,
             winner=winner,
-            advantage=round(abs(comp_a - comp_b), 4),
+            advantage=round(abs(a_score - b_score), 6),
+            a_score=a_score,
+            b_score=b_score,
         )
 
-    # -- reporting ----------------------------------------------------------
-
-    def generate_report(self, rankings: list[RankedSource]) -> str:
-        """Generate a human-readable ranking report.
-
-        Parameters
-        ----------
-        rankings : list[RankedSource]
-            Output from ``rank_sources()`` or ``get_top_sources()``.
-
-        Returns
-        -------
-        str
-            A formatted multi-line report string.
-        """
-        lines: list[str] = []
-        lines.append("Source Ranking Report")
-        lines.append("=" * 60)
-        lines.append("")
-
+    def generate_report(self, rankings: List[RankingResult]) -> str:
+        """Generate a text report of rankings."""
+        lines = ["Source Ranking Report", "=" * 40, f"Total sources evaluated: {len(rankings)}", ""]
         for r in rankings:
-            preview = r.source.text[:60].replace("\n", " ")
-            if len(r.source.text) > 60:
-                preview += "..."
-            lines.append(
-                f'#{r.rank:<3} Score: {r.composite_score:.2f}  | "{preview}"'
-            )
-
-            detail_parts = [
-                f"  recency={r.scores.get('recency', 0):.2f}",
-                f"  authority={r.scores.get('authority', 0):.2f}",
-                f"  citations={r.scores.get('citation_density', 0):.2f}",
-                f"  factual={r.scores.get('factual_language', 0):.2f}",
-            ]
-            lines.append("     " + " |".join(detail_parts))
+            preview = r.source.text[:60] + "..." if len(r.source.text) > 60 else r.source.text
+            lines.append(f"#{r.rank} (score: {r.composite_score:.4f})")
+            lines.append(f"  Text: {preview}")
+            lines.append(f"  Recency: {r.signals.recency:.2f} | Authority: {r.signals.authority:.2f}")
+            lines.append(f"  Citations: {r.signals.citation_density:.2f} | Factual: {r.signals.factual_language:.2f}")
             lines.append("")
-
-        lines.append("=" * 60)
-        lines.append(f"Total sources evaluated: {len(rankings)}")
-        if rankings:
-            best = rankings[0]
-            lines.append(
-                f"Best source: #{best.rank} (score {best.composite_score:.2f})"
-            )
-
         return "\n".join(lines)

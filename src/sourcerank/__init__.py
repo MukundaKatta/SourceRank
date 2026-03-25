@@ -10,10 +10,16 @@ from sourcerank.core import (
 )
 from sourcerank.config import RankerConfig
 
+# Aliases for backward compatibility
+SourceRank = SourceRanker
+SourceRankConfig = RankerConfig
+
 __all__ = [
     "QualitySignals",
     "RankingResult",
     "RankerConfig",
     "SourceDocument",
     "SourceRanker",
+    "SourceRank",
+    "SourceRankConfig",
 ]
